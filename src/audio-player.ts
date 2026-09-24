@@ -61,15 +61,34 @@ export class WebAudioPlayer {
         this.mediaEl = audio;
       }
     }
-    const buffer = this.context.createBuffer(1, audioData.length, sampleRate);
-    // TS lib has Float32Array<ArrayBuffer> here; our parameter is the more
-    // generic ArrayBufferLike form. The runtime contract is identical.
-    buffer.copyToChannel(audioData as Float32Array<ArrayBuffer>, 0);
-    this.audioBuffer = buffer;
+    this.audioBuffer = this.makeBuffer(audioData, sampleRate);
     this.offset = 0;
     this.startedAt = 0;
     this.emit('loadedmetadata');
     this.emit('timeupdate');
+  }
+
+  /**
+   * Swap the samples without moving the playhead, for example to apply or
+   * lift a mute mask. Playback continues from the same position.
+   */
+  replaceAudio(audioData: Float32Array, sampleRate: number): void {
+    if (!this.context) return;
+    const t = this.currentTime;
+    const wasPlaying = this.playing;
+    this.stop(false);
+    this.audioBuffer = this.makeBuffer(audioData, sampleRate);
+    this.offset = Math.min(t, this.audioBuffer.duration);
+    if (wasPlaying) this.play();
+  }
+
+  private makeBuffer(audioData: Float32Array, sampleRate: number): AudioBuffer {
+    if (!this.context) throw new Error('AudioContext not initialized');
+    const buffer = this.context.createBuffer(1, audioData.length, sampleRate);
+    // TS lib has Float32Array<ArrayBuffer> here; our parameter is the more
+    // generic ArrayBufferLike form. The runtime contract is identical.
+    buffer.copyToChannel(audioData as Float32Array<ArrayBuffer>, 0);
+    return buffer;
   }
 
   private output(): AudioNode {
