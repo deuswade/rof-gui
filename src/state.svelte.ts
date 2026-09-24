@@ -11,7 +11,8 @@ import wasmURL from '@ffmpeg/core/wasm?url';
 
 import AnalysisWorker from './analysis-worker.js?worker';
 import { WebAudioPlayer } from './audio-player.js';
-import type { AnalysisResult, AnalysisRegion } from './rof-detector.js';
+import { summarizeBursts } from './rof-detector.js';
+import type { AnalysisResult, AnalysisRegion, BurstResult } from './rof-detector.js';
 import type {
   WorkerRequest,
   WorkerResponse,
@@ -35,7 +36,10 @@ interface AppState {
   error: string | null;
   results: AnalysisResult | null;
   analysisRegions: AnalysisRegion[];
+  /** Time windows of bursts the user has excluded from the summary. */
+  excludedBursts: AnalysisRegion[];
   selectMode: boolean;
+  excludeMode: boolean;
   cursorTime: number;
   player: WebAudioPlayer;
   /** Whether the audio buffer for `file` is decoded and ready in the player. */
@@ -59,7 +63,9 @@ export const app: AppState = $state({
   error: null,
   results: null,
   analysisRegions: [],
+  excludedBursts: [],
   selectMode: false,
+  excludeMode: false,
   cursorTime: 0,
   player: new WebAudioPlayer(),
   hasAudio: false,
@@ -230,7 +236,9 @@ export async function handleFile(file: File | null | undefined): Promise<void> {
 
   app.file = file;
   app.analysisRegions = [];
+  app.excludedBursts = [];
   app.selectMode = false;
+  app.excludeMode = false;
   app.results = null;
   app.error = null;
   app.hasAudio = false;
@@ -371,6 +379,70 @@ export function clearAnalysisRegions(): void {
 
 export function setSelectMode(active: boolean): void {
   app.selectMode = active;
+  if (active) app.excludeMode = false;
+}
+
+export function setExcludeMode(active: boolean): void {
+  app.excludeMode = active;
+  if (active) app.selectMode = false;
+}
+
+// --- Burst exclusion ---
+//
+// Exclusions are stored as time windows rather than burst indices so they
+// survive re-analysis (adding a region renumbers bursts, but a burst's
+// position in the clip barely moves). A burst counts as excluded when its
+// midpoint falls inside a stored window.
+
+function burstMid(b: BurstResult): number {
+  return (b.startTime + b.endTime) / 2;
+}
+
+export function isBurstExcluded(b: BurstResult): boolean {
+  const mid = burstMid(b);
+  return app.excludedBursts.some(w => mid >= w.start && mid <= w.end);
+}
+
+export function toggleBurstExcluded(b: BurstResult): void {
+  if (isBurstExcluded(b)) {
+    const mid = burstMid(b);
+    app.excludedBursts = app.excludedBursts.filter(w => !(mid >= w.start && mid <= w.end));
+  } else {
+    app.excludedBursts = [...app.excludedBursts, { start: b.startTime, end: b.endTime }];
+  }
+}
+
+/** Exclude every burst that overlaps [start, end]. */
+export function excludeBurstsInRange(start: number, end: number): void {
+  const bursts = app.results?.bursts ?? [];
+  const add = bursts
+    .filter(b => b.endTime >= start && b.startTime <= end && !isBurstExcluded(b))
+    .map(b => ({ start: b.startTime, end: b.endTime }));
+  if (add.length > 0) app.excludedBursts = [...app.excludedBursts, ...add];
+}
+
+export function clearExcludedBursts(): void {
+  app.excludedBursts = [];
+}
+
+/**
+ * The results with excluded bursts removed and the summary recomputed.
+ * Shots belonging to excluded bursts are dropped from `peaks` too, so the
+ * headline, stats, result card and JSON export all agree.
+ */
+export function applyExclusions(results: AnalysisResult): AnalysisResult {
+  if (app.excludedBursts.length === 0) return results;
+  const kept = results.bursts.filter(b => !isBurstExcluded(b));
+  if (kept.length === results.bursts.length) return results;
+  const dropped = results.bursts.filter(b => isBurstExcluded(b));
+  const inDropped = (t: number) => dropped.some(b => t >= b.startTime && t <= b.endTime);
+  return {
+    ...results,
+    bursts: kept,
+    summary: summarizeBursts(kept),
+    peaks: results.peaks.filter(idx => !inDropped(idx / results.sampleRate)),
+    excludedBursts: dropped
+  };
 }
 
 export function seekTo(time: number): void {
@@ -402,7 +474,9 @@ export function reset(): void {
   app.file = null;
   app.results = null;
   app.analysisRegions = [];
+  app.excludedBursts = [];
   app.selectMode = false;
+  app.excludeMode = false;
   app.error = null;
   app.hasAudio = false;
   app.cursorTime = 0;

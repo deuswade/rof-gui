@@ -96,6 +96,8 @@ export interface AnalysisResult {
   envelope?: Float32Array;
   /** Set by the state layer before exposing the result to UI components. */
   inputFile?: string;
+  /** Bursts the user excluded from the summary (set by the state layer). */
+  excludedBursts?: BurstResult[];
 }
 
 export type ProgressCallback = (text: string) => void;
@@ -636,94 +638,7 @@ export class RateOfFireDetector implements DetectorParams {
   }
 
   generateSummary(burstResults: BurstResult[]): AnalysisSummary {
-    if (!burstResults || burstResults.length === 0) {
-      return {
-        totalShots: 0,
-        totalBursts: 0,
-        cyclicRateRpm: 0,
-        cyclicRateCI95: 0,
-        overallRateRpm: 0,
-        meanBurstRateRpm: 0,
-        medianBurstRateRpm: 0,
-        minBurstRateRpm: 0,
-        maxBurstRateRpm: 0,
-        stdBurstRateRpm: 0
-      };
-    }
-
-    const rates = burstResults.map(b => b.rateRpm);
-    const totalShots = burstResults.reduce((sum, b) => sum + b.numShots, 0);
-
-    // Pool all within-burst inter-shot intervals. The median of these is the
-    // best headline cyclic rate: robust to outliers and unaffected by pauses
-    // between bursts.
-    const allIntervals: number[] = [];
-    for (const burst of burstResults) {
-      const ivs = signal.diff(burst.shotTimes);
-      for (let i = 0; i < ivs.length; i++) allIntervals.push(ivs[i]);
-    }
-    const medianInterval = allIntervals.length > 0 ? signal.median(allIntervals) : 0;
-    const cyclicRateRpm = medianInterval > 0 ? 60 / medianInterval : 0;
-
-    // Two-level CI on the cyclic rate. Inter-shot intervals within one
-    // burst are NOT independent samples of the gun's period — they
-    // share a per-burst mean (mechanical state, gas, temperature, the
-    // particular magazine), and that mean varies between bursts. Pooling
-    // every interval as i.i.d. understates uncertainty, sometimes by an
-    // order of magnitude.
-    //
-    // Standard fix: when ≥2 bursts exist, treat each burst's median
-    // interval as one trial estimate of the cycle period, and use the
-    // between-burst SE. With one burst, fall back to the within-burst SE
-    // since that's the only source of variation observable.
-    const intervalStd = allIntervals.length > 1 ? signal.std(allIntervals) : 0;
-    let cyclicRateCI95 = 0;
-    if (medianInterval > 0) {
-      const burstMedians: number[] = [];
-      for (const b of burstResults) {
-        if (b.shotTimes.length < 2) continue;
-        const ivs = signal.diff(b.shotTimes);
-        burstMedians.push(signal.median(ivs));
-      }
-      let seT = 0;
-      if (burstMedians.length >= 2) {
-        const meanBurstT = signal.mean(burstMedians);
-        let ss = 0;
-        for (const t of burstMedians) {
-          const d = t - meanBurstT;
-          ss += d * d;
-        }
-        const sdBetween = Math.sqrt(ss / (burstMedians.length - 1));
-        seT = sdBetween / Math.sqrt(burstMedians.length);
-      } else if (allIntervals.length > 1) {
-        seT = intervalStd / Math.sqrt(allIntervals.length);
-      }
-      cyclicRateCI95 = 1.96 * 60 * seT / (medianInterval * medianInterval);
-    }
-
-    const allShotTimes: number[] = [];
-    for (const burst of burstResults) allShotTimes.push(...burst.shotTimes);
-
-    let overallRate = 0;
-    if (allShotTimes.length >= 2) {
-      const totalDuration = signal.max(allShotTimes) - signal.min(allShotTimes);
-      overallRate = ((allShotTimes.length - 1) / totalDuration) * 60;
-    }
-
-    return {
-      totalShots,
-      totalBursts: burstResults.length,
-      cyclicRateRpm,
-      cyclicRateCI95,
-      overallRateRpm: overallRate,
-      meanBurstRateRpm: signal.mean(rates),
-      medianBurstRateRpm: signal.median(rates),
-      minBurstRateRpm: signal.min(rates),
-      maxBurstRateRpm: signal.max(rates),
-      stdBurstRateRpm: signal.std(rates),
-      medianIntervalMs: medianInterval * 1000,
-      intervalStdMs: intervalStd * 1000
-    };
+    return summarizeBursts(burstResults);
   }
 
   /**
@@ -829,6 +744,102 @@ export class RateOfFireDetector implements DetectorParams {
       peaks
     };
   }
+}
+
+/**
+ * Aggregate per-burst results into the headline summary. Standalone so the
+ * UI can recompute it when the user excludes bursts, without re-running
+ * detection.
+ */
+export function summarizeBursts(burstResults: BurstResult[]): AnalysisSummary {
+  if (!burstResults || burstResults.length === 0) {
+    return {
+      totalShots: 0,
+      totalBursts: 0,
+      cyclicRateRpm: 0,
+      cyclicRateCI95: 0,
+      overallRateRpm: 0,
+      meanBurstRateRpm: 0,
+      medianBurstRateRpm: 0,
+      minBurstRateRpm: 0,
+      maxBurstRateRpm: 0,
+      stdBurstRateRpm: 0
+    };
+  }
+
+  const rates = burstResults.map(b => b.rateRpm);
+  const totalShots = burstResults.reduce((sum, b) => sum + b.numShots, 0);
+
+  // Pool all within-burst inter-shot intervals. The median of these is the
+  // best headline cyclic rate: robust to outliers and unaffected by pauses
+  // between bursts.
+  const allIntervals: number[] = [];
+  for (const burst of burstResults) {
+    const ivs = signal.diff(burst.shotTimes);
+    for (let i = 0; i < ivs.length; i++) allIntervals.push(ivs[i]);
+  }
+  const medianInterval = allIntervals.length > 0 ? signal.median(allIntervals) : 0;
+  const cyclicRateRpm = medianInterval > 0 ? 60 / medianInterval : 0;
+
+  // Two-level CI on the cyclic rate. Inter-shot intervals within one
+  // burst are NOT independent samples of the gun's period — they
+  // share a per-burst mean (mechanical state, gas, temperature, the
+  // particular magazine), and that mean varies between bursts. Pooling
+  // every interval as i.i.d. understates uncertainty, sometimes by an
+  // order of magnitude.
+  //
+  // Standard fix: when ≥2 bursts exist, treat each burst's median
+  // interval as one trial estimate of the cycle period, and use the
+  // between-burst SE. With one burst, fall back to the within-burst SE
+  // since that's the only source of variation observable.
+  const intervalStd = allIntervals.length > 1 ? signal.std(allIntervals) : 0;
+  let cyclicRateCI95 = 0;
+  if (medianInterval > 0) {
+    const burstMedians: number[] = [];
+    for (const b of burstResults) {
+      if (b.shotTimes.length < 2) continue;
+      const ivs = signal.diff(b.shotTimes);
+      burstMedians.push(signal.median(ivs));
+    }
+    let seT = 0;
+    if (burstMedians.length >= 2) {
+      const meanBurstT = signal.mean(burstMedians);
+      let ss = 0;
+      for (const t of burstMedians) {
+        const d = t - meanBurstT;
+        ss += d * d;
+      }
+      const sdBetween = Math.sqrt(ss / (burstMedians.length - 1));
+      seT = sdBetween / Math.sqrt(burstMedians.length);
+    } else if (allIntervals.length > 1) {
+      seT = intervalStd / Math.sqrt(allIntervals.length);
+    }
+    cyclicRateCI95 = 1.96 * 60 * seT / (medianInterval * medianInterval);
+  }
+
+  const allShotTimes: number[] = [];
+  for (const burst of burstResults) allShotTimes.push(...burst.shotTimes);
+
+  let overallRate = 0;
+  if (allShotTimes.length >= 2) {
+    const totalDuration = signal.max(allShotTimes) - signal.min(allShotTimes);
+    overallRate = ((allShotTimes.length - 1) / totalDuration) * 60;
+  }
+
+  return {
+    totalShots,
+    totalBursts: burstResults.length,
+    cyclicRateRpm,
+    cyclicRateCI95,
+    overallRateRpm: overallRate,
+    meanBurstRateRpm: signal.mean(rates),
+    medianBurstRateRpm: signal.median(rates),
+    minBurstRateRpm: signal.min(rates),
+    maxBurstRateRpm: signal.max(rates),
+    stdBurstRateRpm: signal.std(rates),
+    medianIntervalMs: medianInterval * 1000,
+    intervalStdMs: intervalStd * 1000
+  };
 }
 
 /**

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { app, reset, handleFile } from './state.svelte.js';
+  import { app, reset, handleFile, applyExclusions } from './state.svelte.js';
   import DropZone from './components/DropZone.svelte';
   import HeroResult from './components/HeroResult.svelte';
   import Timeline from './components/Timeline.svelte';
@@ -15,6 +15,9 @@
     'rate of fire meter'
   ];
   const tagline = TAGLINES[Math.floor(Math.random() * TAGLINES.length)];
+
+  // Results with user-excluded bursts removed; drives the headline and exports.
+  const included = $derived(app.results ? applyExclusions(app.results) : null);
 
   let dragDepth = 0;
   let dragActive = $state(false);
@@ -95,7 +98,7 @@
     {:else if !app.results}
       <AnalyzingPlaceholder text={app.loadingText || 'Analyzing…'} />
     {:else}
-      <HeroResult results={app.results} />
+      <HeroResult results={included ?? app.results} />
       <Timeline />
       <BurstStrip results={app.results} />
     {/if}

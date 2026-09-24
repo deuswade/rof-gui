@@ -11,18 +11,22 @@
    * Viewport (viewStart/viewEnd in seconds) is decoupled from cursorTime so
    * scrolling the view doesn't move playback and vice versa. Click=seek,
    * drag=pan, wheel/pinch=zoom around pointer, double-click=fit.
+   *
+   * Exclude mode: drag across bursts (or click one, on either canvas) to
+   * leave them out of the summary, for example shots from a neighboring lane.
    */
   import { onMount, onDestroy } from 'svelte';
   import {
     app, addAnalysisRegion, clearAnalysisRegions,
-    setSelectMode, seekTo, togglePlay,
-    getRawAudio, ensureSpectrogram
+    setSelectMode, setExcludeMode, seekTo, togglePlay,
+    getRawAudio, ensureSpectrogram,
+    isBurstExcluded, toggleBurstExcluded, excludeBurstsInRange, clearExcludedBursts
   } from '../state.svelte.js';
   import { downloadPlot } from '../exports.js';
   import type { SpectrogramData } from '../analysis-worker.js';
 
   type ViewMode = 'envelope' | 'waveform' | 'spectrogram';
-  type DragMode = 'pan' | 'select' | null;
+  type DragMode = 'pan' | 'select' | 'exclude' | null;
 
   interface WaveformMip {
     data: Float32Array;
@@ -80,6 +84,11 @@
       : []
   );
   const bursts = $derived(app.results?.bursts ?? []);
+  // Read app.excludedBursts so the flags recompute when exclusions change.
+  const burstExcluded = $derived(
+    (void app.excludedBursts, bursts.map(b => isBurstExcluded(b)))
+  );
+  const excludedList = $derived(bursts.filter((_, i) => burstExcluded[i]));
 
   // --- Drag/pinch/pan state ---
   let pointerDown = false;
@@ -153,7 +162,7 @@
   $effect(() => {
     void viewStart; void viewEnd; void viewMode;
     void app.cursorTime; void app.analysisRegions;
-    void peakTimes; void bursts; void hoverTime;
+    void peakTimes; void bursts; void burstExcluded; void hoverTime;
     void hoveredShotIdx; void hoveredBurstIdx;
     requestRender();
   });
@@ -285,6 +294,7 @@
     ctx.clearRect(0, 0, cssW, H_MAIN);
 
     drawAnalysisRegions(ctx);
+    drawExcludedBursts(ctx);
 
     if (viewMode === 'envelope') drawEnvelope(ctx);
     else if (viewMode === 'waveform') drawWaveform(ctx);
@@ -330,6 +340,40 @@
       ctx.lineTo(x1 - 0.5, H_MAIN);
       ctx.stroke();
     }
+  }
+
+  function drawExcludedBursts(ctx: CanvasRenderingContext2D) {
+    const padTop = SHOT_TICK_AREA + 2;
+    for (let i = 0; i < bursts.length; i++) {
+      if (!burstExcluded[i]) continue;
+      const b = bursts[i];
+      if (b.endTime < viewStart || b.startTime > viewEnd) continue;
+      const x0 = timeToX(Math.max(b.startTime, viewStart));
+      const x1 = timeToX(Math.min(b.endTime, viewEnd));
+      const w = Math.max(2, x1 - x0);
+      ctx.fillStyle = 'rgba(192, 57, 43, 0.08)';
+      ctx.fillRect(x0, padTop, w, H_MAIN - padTop);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(x0, padTop, w, H_MAIN - padTop);
+      ctx.clip();
+      ctx.strokeStyle = 'rgba(192, 57, 43, 0.18)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let x = x0 - H_MAIN; x < x0 + w; x += 8) {
+        ctx.moveTo(x, H_MAIN);
+        ctx.lineTo(x + H_MAIN, 0);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  function isTimeExcluded(t: number): boolean {
+    for (let i = 0; i < bursts.length; i++) {
+      if (burstExcluded[i] && t >= bursts[i].startTime && t <= bursts[i].endTime) return true;
+    }
+    return false;
   }
 
   function drawEnvelope(ctx: CanvasRenderingContext2D) {
@@ -475,18 +519,21 @@
 
   function drawShotTicks(ctx: CanvasRenderingContext2D) {
     if (peakTimes.length === 0) return;
-    ctx.strokeStyle = 'rgba(0, 135, 154, 0.85)';
     ctx.lineWidth = 1;
-    ctx.beginPath();
-    for (let i = 0; i < peakTimes.length; i++) {
-      if (i === hoveredShotIdx) continue;
-      const t = peakTimes[i];
-      if (t < viewStart || t > viewEnd) continue;
-      const x = Math.round(timeToX(t)) + 0.5;
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, SHOT_TICK_AREA);
+    for (const excludedPass of [false, true]) {
+      ctx.strokeStyle = excludedPass ? 'rgba(152, 152, 143, 0.6)' : 'rgba(0, 135, 154, 0.85)';
+      ctx.beginPath();
+      for (let i = 0; i < peakTimes.length; i++) {
+        if (i === hoveredShotIdx) continue;
+        const t = peakTimes[i];
+        if (t < viewStart || t > viewEnd) continue;
+        if (isTimeExcluded(t) !== excludedPass) continue;
+        const x = Math.round(timeToX(t)) + 0.5;
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, SHOT_TICK_AREA);
+      }
+      ctx.stroke();
     }
-    ctx.stroke();
     if (hoveredShotIdx >= 0) {
       const t = peakTimes[hoveredShotIdx];
       if (t >= viewStart && t <= viewEnd) {
@@ -526,14 +573,16 @@
   }
 
   function drawDragPreview(ctx: CanvasRenderingContext2D) {
-    if (dragMode !== 'select') return;
+    if (dragMode !== 'select' && dragMode !== 'exclude') return;
+    if (!pointerMoved) return;
     const t0 = Math.min(dragSelectT0, dragSelectT1);
     const t1 = Math.max(dragSelectT0, dragSelectT1);
     const x0 = timeToX(t0);
     const x1 = timeToX(t1);
-    ctx.fillStyle = 'rgba(0, 135, 154, 0.18)';
+    const exclude = dragMode === 'exclude';
+    ctx.fillStyle = exclude ? 'rgba(192, 57, 43, 0.14)' : 'rgba(0, 135, 154, 0.18)';
     ctx.fillRect(x0, 0, x1 - x0, H_MAIN);
-    ctx.strokeStyle = 'rgba(0, 135, 154, 0.85)';
+    ctx.strokeStyle = exclude ? 'rgba(192, 57, 43, 0.85)' : 'rgba(0, 135, 154, 0.85)';
     ctx.lineWidth = 1;
     ctx.setLineDash([4, 3]);
     ctx.strokeRect(x0 + 0.5, 0.5, x1 - x0 - 1, H_MAIN - 1);
@@ -554,8 +603,19 @@
       const x0 = timeToX(Math.max(b.startTime, viewStart));
       const x1 = timeToX(Math.min(b.endTime, viewEnd));
       const w = Math.max(2, x1 - x0);
-      ctx.fillStyle = i === hoveredBurstIdx ? '#006B7C' : '#00879A';
-      ctx.fillRect(x0, y, w, h);
+      if (burstExcluded[i]) {
+        ctx.fillStyle = i === hoveredBurstIdx ? '#B8B8B0' : '#D4D4CE';
+        ctx.fillRect(x0, y, w, h);
+        ctx.strokeStyle = '#C0392B';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(x0, y + h / 2);
+        ctx.lineTo(x0 + w, y + h / 2);
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = i === hoveredBurstIdx ? '#006B7C' : '#00879A';
+        ctx.fillRect(x0, y, w, h);
+      }
     }
   }
 
@@ -664,7 +724,11 @@
     pointerStartViewEnd = viewEnd;
     // When fully zoomed out there's nothing to pan to, so a drag is more
     // useful as a region selection.
-    if (app.selectMode || isFitted) {
+    if (app.excludeMode) {
+      dragMode = 'exclude';
+      dragSelectT0 = pointerStartT;
+      dragSelectT1 = pointerStartT;
+    } else if (app.selectMode || isFitted) {
       dragMode = 'select';
       dragSelectT0 = pointerStartT;
       dragSelectT1 = pointerStartT;
@@ -703,7 +767,7 @@
       if (newEnd > duration) { newEnd = duration; newStart = Math.max(0, duration - sp); }
       viewStart = newStart;
       viewEnd = newEnd;
-    } else if (dragMode === 'select') {
+    } else if (dragMode === 'select' || dragMode === 'exclude') {
       dragSelectT1 = t;
       requestRender();
     }
@@ -737,11 +801,18 @@
     pointerDown = false;
     try { mainCanvas.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
     if (!pointerMoved) {
-      seekTo(eventTime(e.clientX));
+      const t = eventTime(e.clientX);
+      const idx = app.excludeMode ? findBurstAt(t) : -1;
+      if (idx >= 0) toggleBurstExcluded(bursts[idx]);
+      else seekTo(t);
     } else if (dragMode === 'select') {
       const t0 = Math.min(dragSelectT0, dragSelectT1);
       const t1 = Math.max(dragSelectT0, dragSelectT1);
       if (t1 - t0 > 0.01) addAnalysisRegion({ start: t0, end: t1 });
+    } else if (dragMode === 'exclude') {
+      const t0 = Math.min(dragSelectT0, dragSelectT1);
+      const t1 = Math.max(dragSelectT0, dragSelectT1);
+      excludeBurstsInRange(t0, t1);
     }
     dragMode = null;
     requestRender();
@@ -772,7 +843,8 @@
     const cssX = e.clientX - rect.left;
     const t = xToTime(cssX);
     const idx = findBurstAt(t);
-    if (idx >= 0) seekTo(bursts[idx].startTime);
+    if (idx >= 0 && app.excludeMode) toggleBurstExcluded(bursts[idx]);
+    else if (idx >= 0) seekTo(bursts[idx].startTime);
     else seekTo(t);
   }
 
@@ -907,6 +979,13 @@
     {/if}
 
     <button
+      class="tool exclude"
+      class:active={app.excludeMode}
+      onclick={() => setExcludeMode(!app.excludeMode)}
+      title="Drag across bursts, or click one, to leave them out of the results"
+    >✕ Exclude</button>
+
+    <button
       class="tool"
       onclick={fitView}
       disabled={isFitted}
@@ -924,7 +1003,7 @@
     <canvas
       bind:this={mainCanvas}
       class="main-canvas"
-      class:select-mode={app.selectMode || isFitted}
+      class:select-mode={app.selectMode || isFitted || app.excludeMode}
       onpointerdown={onPointerDown}
       onpointermove={onPointerMove}
       onpointerup={onPointerUp}
@@ -957,6 +1036,11 @@
         <div class="tt-title">Burst #{b.burstNumber}</div>
         <div class="tt-row"><span>{Math.round(b.rateRpm)}</span> RPM</div>
         <div class="tt-row"><span>{b.numShots}</span> shots · {(b.duration * 1000).toFixed(0)} ms</div>
+        {#if burstExcluded[hoveredBurstIdx]}
+          <div class="tt-row tt-sub">excluded{app.excludeMode ? ' · click to restore' : ''}</div>
+        {:else if app.excludeMode}
+          <div class="tt-row tt-sub">click to exclude</div>
+        {/if}
       {:else}
         {@const t = peakTimes[hoveredShotIdx]}
         <div class="tt-title">Shot</div>
@@ -975,6 +1059,20 @@
       {#each app.analysisRegions as r}
         <span class="region-chip">{r.start.toFixed(2)}–{r.end.toFixed(2)}s</span>
       {/each}
+    </div>
+  {/if}
+
+  {#if excludedList.length > 0}
+    <div class="region-summary">
+      <span class="region-label">Excluded</span>
+      {#each excludedList as b}
+        <button
+          class="region-chip excluded-chip"
+          onclick={() => toggleBurstExcluded(b)}
+          title="Restore burst #{b.burstNumber}"
+        >#{b.burstNumber} ✕</button>
+      {/each}
+      <button class="tool ghost" onclick={clearExcludedBursts}>Restore all</button>
     </div>
   {/if}
 </section>
@@ -1075,6 +1173,12 @@
     color: white;
   }
   .tool.ghost:hover { border-color: var(--danger); color: var(--danger); }
+  .tool.exclude:hover:not(.active) { border-color: var(--danger); color: var(--danger); }
+  .tool.exclude.active {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: white;
+  }
   .tool:disabled {
     opacity: 0.4;
     cursor: not-allowed;
@@ -1117,6 +1221,16 @@
     background: var(--accent-bg);
     color: var(--accent-hover);
     border-radius: 12px;
+  }
+
+  .excluded-chip {
+    border: none;
+    background: #FCEDED;
+    color: var(--danger);
+    cursor: pointer;
+  }
+  .excluded-chip:hover {
+    background: #F0C4C4;
   }
 
   .tooltip {
