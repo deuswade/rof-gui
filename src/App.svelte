@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { app, reset, handleFile, applyExclusions } from './state.svelte.js';
+  import { app, reset, handleFile, applyExclusions, syncPlaybackMute } from './state.svelte.js';
   import DropZone from './components/DropZone.svelte';
   import HeroResult from './components/HeroResult.svelte';
   import Timeline from './components/Timeline.svelte';
@@ -18,6 +18,12 @@
 
   // Results with user-excluded bursts removed; drives the headline and exports.
   const included = $derived(app.results ? applyExclusions(app.results) : null);
+
+  // Keep the muted playback audio in step with the included bursts.
+  $effect(() => {
+    void app.muteGaps;
+    syncPlaybackMute(included);
+  });
 
   let dragDepth = 0;
   let dragActive = $state(false);

@@ -67,6 +67,8 @@ export interface BurstResult {
   minInterval: number;
   maxInterval: number;
   shotTimes: number[];
+  /** Found by analyzing a selection and added to the full-clip results. */
+  added?: boolean;
 }
 
 export interface AnalysisSummary {

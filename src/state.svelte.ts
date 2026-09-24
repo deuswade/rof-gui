@@ -35,6 +35,12 @@ interface AppState {
   loadingText: string;
   error: string | null;
   results: AnalysisResult | null;
+  /** Latest whole-clip result, kept so clearing a selection is instant. */
+  fullResults: AnalysisResult | null;
+  /** Bursts found in a selection and added to the whole-clip results. */
+  addedBursts: BurstResult[];
+  /** Silence playback outside the included bursts. */
+  muteGaps: boolean;
   analysisRegions: AnalysisRegion[];
   /** Time windows of bursts the user has excluded from the summary. */
   excludedBursts: AnalysisRegion[];
@@ -62,6 +68,9 @@ export const app: AppState = $state({
   loadingText: '',
   error: null,
   results: null,
+  fullResults: null,
+  addedBursts: [],
+  muteGaps: false,
   analysisRegions: [],
   excludedBursts: [],
   selectMode: false,
@@ -237,6 +246,8 @@ export async function handleFile(file: File | null | undefined): Promise<void> {
   app.file = file;
   app.analysisRegions = [];
   app.excludedBursts = [];
+  app.addedBursts = [];
+  app.fullResults = null;
   app.selectMode = false;
   app.excludeMode = false;
   app.results = null;
@@ -309,6 +320,7 @@ async function extractAudioToCache(file: File, token: number): Promise<void> {
     duration: audioBuffer.duration
   };
   app.player.setAudio(cachedAudio.audioData, cachedAudio.sampleRate);
+  muteApplied = false;
   app.hasAudio = true;
   app.audioVersion++;
   await workerSetAudio(cachedAudio.audioData, cachedAudio.sampleRate);
@@ -339,7 +351,12 @@ async function runAnalysis(): Promise<void> {
   if (id !== lastAnalyzeId) return; // stale result; a newer analyze is in flight
   results.inputFile = app.file.name;
   results.audioDuration = cachedAudio.duration;
-  app.results = results;
+  if (app.analysisRegions.length === 0) {
+    app.fullResults = results;
+    app.results = withAddedBursts(results);
+  } else {
+    app.results = results;
+  }
   app.error = null;
 }
 
@@ -374,7 +391,104 @@ export function addAnalysisRegion(region: AnalysisRegion): void {
 export function clearAnalysisRegions(): void {
   if (app.analysisRegions.length === 0) return;
   app.analysisRegions = [];
-  scheduleReanalysis();
+  if (app.fullResults) {
+    // Back to the cached whole-clip result: no re-analysis needed. Drop any
+    // selection analysis still pending or in flight so it can't land late.
+    if (reanalysisTimeout) clearTimeout(reanalysisTimeout);
+    reanalysisTimeout = null;
+    lastAnalyzeId = 0;
+    app.loading = false;
+    app.results = withAddedBursts(app.fullResults);
+  } else {
+    scheduleReanalysis();
+  }
+}
+
+// --- Adding bursts found in a selection ---
+
+function overlaps(a: BurstResult, b: BurstResult): boolean {
+  return a.startTime <= b.endTime && a.endTime >= b.startTime;
+}
+
+/**
+ * Bursts the current selection found that the whole-clip analysis (plus
+ * anything already added) does not have. Empty when no selection is active.
+ */
+export function newBurstsInSelection(): BurstResult[] {
+  if (app.analysisRegions.length === 0 || !app.results || !app.fullResults) return [];
+  const known = [...app.fullResults.bursts, ...app.addedBursts];
+  return app.results.bursts.filter(b => !known.some(k => overlaps(b, k)));
+}
+
+/** Add the selection's new bursts to the whole-clip results and return to them. */
+export function addNewBurstsFromSelection(): void {
+  const found = newBurstsInSelection();
+  if (found.length === 0) return;
+  app.addedBursts = [...app.addedBursts, ...found.map(b => ({ ...b, added: true }))];
+  clearAnalysisRegions();
+}
+
+/**
+ * Whole-clip results with added bursts merged in, renumbered in time order
+ * and with the summary recomputed.
+ */
+function withAddedBursts(full: AnalysisResult): AnalysisResult {
+  if (app.addedBursts.length === 0) return full;
+  const added = $state.snapshot(app.addedBursts) as BurstResult[];
+  const bursts = [...full.bursts, ...added]
+    .sort((a, b) => a.startTime - b.startTime)
+    .map((b, i) => ({ ...b, burstNumber: i + 1 }));
+  const peaks = new Set(full.peaks);
+  for (const b of added) for (const t of b.shotTimes) peaks.add(Math.round(t * full.sampleRate));
+  return {
+    ...full,
+    bursts,
+    peaks: Array.from(peaks).sort((a, b) => a - b),
+    summary: summarizeBursts(bursts)
+  };
+}
+
+// --- Muting playback outside the included bursts ---
+
+const MUTE_PAD_BEFORE = 0.15; // s of lead-in kept before each burst
+const MUTE_PAD_AFTER = 0.3;   // s kept after each burst, for the echo tail
+const MUTE_FADE = 0.01;       // s fade at each edge, avoids clicks
+
+let muteApplied = false;
+
+/** Time windows that stay audible when muting gaps: included bursts, padded. */
+export function audibleWindows(results: AnalysisResult): AnalysisRegion[] {
+  const windows = results.bursts
+    .map(b => ({ start: b.startTime - MUTE_PAD_BEFORE, end: b.endTime + MUTE_PAD_AFTER }))
+    .sort((a, b) => a.start - b.start);
+  return mergeRegions(windows);
+}
+
+export function setMuteGaps(active: boolean): void {
+  app.muteGaps = active;
+}
+
+/** Apply or lift the mute mask on the player's audio to match `results`. */
+export function syncPlaybackMute(results: AnalysisResult | null): void {
+  if (!cachedAudio) return;
+  const { audioData, sampleRate } = cachedAudio;
+  if (!app.muteGaps || !results) {
+    if (muteApplied) app.player.replaceAudio(audioData, sampleRate);
+    muteApplied = false;
+    return;
+  }
+  const out = new Float32Array(audioData.length);
+  const fade = Math.max(1, Math.round(MUTE_FADE * sampleRate));
+  for (const w of audibleWindows(results)) {
+    const i0 = Math.max(0, Math.floor(w.start * sampleRate));
+    const i1 = Math.min(out.length, Math.ceil(w.end * sampleRate));
+    for (let i = i0; i < i1; i++) {
+      const edge = Math.min(i - i0, i1 - 1 - i);
+      out[i] = audioData[i] * (edge < fade ? edge / fade : 1);
+    }
+  }
+  app.player.replaceAudio(out, sampleRate);
+  muteApplied = true;
 }
 
 export function setSelectMode(active: boolean): void {
@@ -475,6 +589,8 @@ export function reset(): void {
   app.results = null;
   app.analysisRegions = [];
   app.excludedBursts = [];
+  app.addedBursts = [];
+  app.fullResults = null;
   app.selectMode = false;
   app.excludeMode = false;
   app.error = null;

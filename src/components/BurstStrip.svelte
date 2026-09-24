@@ -42,7 +42,7 @@
               class="card-id"
               onclick={() => seekTo(b.startTime)}
               title="Jump to this burst on the timeline"
-            >#{b.burstNumber}{#if excluded[i]}<span class="card-tag">excluded</span>{/if}</button>
+            >#{b.burstNumber}{#if excluded[i]}<span class="card-tag">excluded</span>{:else if b.added}<span class="card-tag added">added</span>{/if}</button>
             <button
               class="card-toggle"
               onclick={() => toggleBurstExcluded(b)}
@@ -205,6 +205,10 @@
     text-transform: uppercase;
     font-size: 10px;
     color: var(--danger);
+  }
+
+  .card-tag.added {
+    color: var(--accent);
   }
 
   .card-toggle {

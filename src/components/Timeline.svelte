@@ -20,7 +20,9 @@
     app, addAnalysisRegion, clearAnalysisRegions,
     setSelectMode, setExcludeMode, seekTo, togglePlay,
     getRawAudio, ensureSpectrogram,
-    isBurstExcluded, toggleBurstExcluded, excludeBurstsInRange, clearExcludedBursts
+    isBurstExcluded, toggleBurstExcluded, excludeBurstsInRange, clearExcludedBursts,
+    newBurstsInSelection, addNewBurstsFromSelection,
+    applyExclusions, audibleWindows, setMuteGaps
   } from '../state.svelte.js';
   import { downloadPlot } from '../exports.js';
   import type { SpectrogramData } from '../analysis-worker.js';
@@ -89,6 +91,16 @@
     (void app.excludedBursts, bursts.map(b => isBurstExcluded(b)))
   );
   const excludedList = $derived(bursts.filter((_, i) => burstExcluded[i]));
+  const newBursts = $derived(
+    (void app.analysisRegions, void app.results, void app.fullResults, void app.addedBursts,
+      newBurstsInSelection())
+  );
+  // Stretches that playback skips over while Mute gaps is on.
+  const audible = $derived(
+    app.muteGaps && app.results
+      ? (void app.excludedBursts, audibleWindows(applyExclusions(app.results)))
+      : null
+  );
 
   // --- Drag/pinch/pan state ---
   let pointerDown = false;
@@ -162,7 +174,7 @@
   $effect(() => {
     void viewStart; void viewEnd; void viewMode;
     void app.cursorTime; void app.analysisRegions;
-    void peakTimes; void bursts; void burstExcluded; void hoverTime;
+    void peakTimes; void bursts; void burstExcluded; void audible; void hoverTime;
     void hoveredShotIdx; void hoveredBurstIdx;
     requestRender();
   });
@@ -294,6 +306,7 @@
     ctx.clearRect(0, 0, cssW, H_MAIN);
 
     drawAnalysisRegions(ctx);
+    drawMutedGaps(ctx);
     drawExcludedBursts(ctx);
 
     if (viewMode === 'envelope') drawEnvelope(ctx);
@@ -339,6 +352,19 @@
       ctx.moveTo(x1 - 0.5, 0);
       ctx.lineTo(x1 - 0.5, H_MAIN);
       ctx.stroke();
+    }
+  }
+
+  function drawMutedGaps(ctx: CanvasRenderingContext2D) {
+    if (!audible) return;
+    const padTop = SHOT_TICK_AREA + 2;
+    ctx.fillStyle = 'rgba(31, 41, 55, 0.07)';
+    let prev = 0;
+    for (const w of [...audible, { start: duration, end: duration }]) {
+      const a = Math.max(prev, viewStart);
+      const b = Math.min(w.start, viewEnd);
+      if (b > a) ctx.fillRect(timeToX(a), padTop, timeToX(b) - timeToX(a), H_MAIN - padTop);
+      prev = Math.max(prev, w.end);
     }
   }
 
@@ -615,6 +641,11 @@
       } else {
         ctx.fillStyle = i === hoveredBurstIdx ? '#006B7C' : '#00879A';
         ctx.fillRect(x0, y, w, h);
+        if (b.added) {
+          ctx.strokeStyle = '#E07B00';
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(x0 - 1, y - 1, w + 2, h + 2);
+        }
       }
     }
   }
@@ -987,6 +1018,14 @@
 
     <button
       class="tool"
+      class:active={app.muteGaps}
+      onclick={() => setMuteGaps(!app.muteGaps)}
+      disabled={!app.hasAudio}
+      title="Silence playback outside the included bursts"
+    >Mute gaps</button>
+
+    <button
+      class="tool"
       onclick={fitView}
       disabled={isFitted}
       title="Reset zoom (double-click the timeline)"
@@ -1036,6 +1075,9 @@
         <div class="tt-title">Burst #{b.burstNumber}</div>
         <div class="tt-row"><span>{Math.round(b.rateRpm)}</span> RPM</div>
         <div class="tt-row"><span>{b.numShots}</span> shots · {(b.duration * 1000).toFixed(0)} ms</div>
+        {#if b.added}
+          <div class="tt-row tt-sub">added from a selection</div>
+        {/if}
         {#if burstExcluded[hoveredBurstIdx]}
           <div class="tt-row tt-sub">excluded{app.excludeMode ? ' · click to restore' : ''}</div>
         {:else if app.excludeMode}
@@ -1059,6 +1101,20 @@
       {#each app.analysisRegions as r}
         <span class="region-chip">{r.start.toFixed(2)}–{r.end.toFixed(2)}s</span>
       {/each}
+      <span class="spacer"></span>
+      {#if app.fullResults && !app.loading}
+        {#if newBursts.length > 0}
+          <span class="region-note">
+            {newBursts.length} burst{newBursts.length !== 1 ? 's' : ''} not in the full-clip results
+          </span>
+          <button class="tool add" onclick={addNewBurstsFromSelection}>
+            Add {newBursts.length === 1 ? 'burst' : `${newBursts.length} bursts`} to results
+          </button>
+        {:else}
+          <span class="region-note">Nothing new in this selection</span>
+        {/if}
+      {/if}
+      <button class="tool" onclick={clearAnalysisRegions}>Back to full clip</button>
     </div>
   {/if}
 
@@ -1174,9 +1230,21 @@
   }
   .tool.ghost:hover { border-color: var(--danger); color: var(--danger); }
   .tool.exclude:hover:not(.active) { border-color: var(--danger); color: var(--danger); }
+  /* Keep active toggles readable on hover; the generic hover rule above
+     would otherwise paint accent text on the accent background. */
+  .tool.active:hover:not(:disabled) {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+    color: white;
+  }
   .tool.exclude.active {
     background: var(--danger);
     border-color: var(--danger);
+    color: white;
+  }
+  .tool.exclude.active:hover:not(:disabled) {
+    background: #A33024;
+    border-color: #A33024;
     color: white;
   }
   .tool:disabled {
@@ -1221,6 +1289,21 @@
     background: var(--accent-bg);
     color: var(--accent-hover);
     border-radius: 12px;
+  }
+
+  .region-note {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .tool.add {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+  }
+  .tool.add:hover:not(:disabled) {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+    color: white;
   }
 
   .excluded-chip {
